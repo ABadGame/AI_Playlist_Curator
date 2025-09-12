@@ -33,7 +33,7 @@ FETCH_DETAILS_DELAY_MIN_SECONDS = 1.0 # Reduced slightly for faster fetching if 
 FETCH_DETAILS_DELAY_MAX_SECONDS = 3.0
 
 # LLM Configuration
-LLM_MODEL_NAME = "gemini-2.0-flash"  
+LLM_MODEL_NAME = "gemini-2.5-pro"  
 LLM_TEMPERATURE = 0.20
 
 # Fuzzy Matching Configuration
@@ -592,3 +592,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
