@@ -5,7 +5,8 @@ import traceback
 import random
 from dotenv import load_dotenv
 from ytmusicapi import YTMusic
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from fuzzywuzzy import process, fuzz
 
 # --- CONFIGURATION ---
@@ -33,8 +34,12 @@ FETCH_DETAILS_DELAY_MIN_SECONDS = 1.0 # Reduced slightly for faster fetching if 
 FETCH_DETAILS_DELAY_MAX_SECONDS = 3.0
 
 # LLM Configuration
-LLM_MODEL_NAME = "gemini-2.5-pro"  
+LLM_MODEL_NAME = "gemini-3.5-flash"
 LLM_TEMPERATURE = 0.20
+
+# Number of songs sent to Gemini per request.
+# 200-300 works well for large playlists.
+LLM_SONG_BATCH_SIZE = 250
 
 # Fuzzy Matching Configuration
 FUZZY_MATCH_THRESHOLD = 65
@@ -71,28 +76,18 @@ def initialize_ytmusic_client() -> YTMusic:
         print(f"Error initializing YTMusic: {e}\nEnsure '{YTMusic_AUTH_FILE}' is valid or run 'ytmusicapi oauth'.")
         exit(1)
 
-def initialize_gemini_model() -> genai.GenerativeModel:
+def initialize_gemini_model():
     if not GEMINI_API_KEY:
         print("Error: GOOGLE_API_KEY not found in .env file.")
         exit(1)
+
     print(f"Initializing Gemini AI model ('{LLM_MODEL_NAME}')...")
+
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        generation_config = genai.types.GenerationConfig(temperature=LLM_TEMPERATURE)
-        # Safety settings to be less restrictive if needed, but use with caution
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ]
-        llm_model = genai.GenerativeModel(
-            LLM_MODEL_NAME,
-            generation_config=generation_config,
-            safety_settings=safety_settings # Apply safety settings
-        )
+        client = genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini AI model initialized successfully.")
-        return llm_model
+        return client
+
     except Exception as e:
         print(f"Error initializing Gemini AI: {e}")
         traceback.print_exc()
@@ -227,114 +222,212 @@ def fetch_playlist_songs(
         print(f"Error fetching/processing songs: {e}"); traceback.print_exc(); exit(1)
 
 def get_ai_song_suggestions(
-    llm_model: genai.GenerativeModel,
+    llm_client,
     playlist_criteria: dict,
     song_data_for_llm: list[str]
 ) -> list[str]:
+
     new_playlist_title = playlist_criteria['title']
-    print(f"\nAsking AI to select songs for the new playlist: '{new_playlist_title}' based on detailed criteria...")
-    print("This may take a moment...")
-    random_delay(1,3)
+
+    print(
+        f"\nAsking AI to select songs for the new playlist: "
+        f"'{new_playlist_title}'..."
+    )
 
     if not song_data_for_llm:
-        print("No song data provided to LLM."); return []
-
-    songs_list_for_prompt = "\n---\n".join(song_data_for_llm)
-    has_album_data = any("Album:" in entry for entry in song_data_for_llm)
-    has_description_data = any("Description:" in entry for entry in song_data_for_llm)
-
-    criteria_prompt_parts = [f"The user wants to create a new playlist titled: \"{new_playlist_title}\"."]
-    if desc := playlist_criteria.get('description'):
-        criteria_prompt_parts.append(f"Playlist Description: {desc}")
-    if genres := playlist_criteria.get('genres'):
-        criteria_prompt_parts.append(f"Desired Genre(s): {genres}")
-    if artists := playlist_criteria.get('artists'):
-        criteria_prompt_parts.append(f"Preferred Artist(s) (consider these strongly if their songs appear in the list): {artists}")
-    if moods := playlist_criteria.get('moods'):
-        criteria_prompt_parts.append(f"Desired Mood(s)/Vibe(s): {moods}")
-    if keywords := playlist_criteria.get('keywords'):
-        criteria_prompt_parts.append(f"Other Keywords: {keywords}")
-
-    criteria_summary_prompt = "\n".join(criteria_prompt_parts)
-
-    prompt_intro = f"""You are an expert music curator AI.
-{criteria_summary_prompt}
-
-Your task is to carefully review the "Available songs" list below. Each song entry is separated by "---".
-Each song entry includes Title and Artist. """
-
-    available_info_parts = ["Title", "Artist"]
-    if has_album_data: available_info_parts.append("Album")
-    if has_description_data: available_info_parts.append("Description")
-
-    available_info_str = " and ".join(filter(None, [", ".join(available_info_parts[:-1]), available_info_parts[-1]])) if len(available_info_parts) > 1 else available_info_parts[0]
-    
-    prompt_intro += f"It may also include {'an Album title' if has_album_data else ''}{' and a song Description' if has_description_data and has_album_data else ''}{'a song Description' if has_description_data and not has_album_data else ''}. "
-    prompt_intro += f"Use ALL available information ({available_info_str}) for each song in the list to make your choices.\n"
-
-
-    prompt_intro += f"""
-Critically evaluate how well each song from the "Available songs" list aligns with the user's detailed playlist criteria.
-Consider things like:
-- Does the song's Artist typically align with the requested genres or preferred artists? (If preferred artists are listed, prioritize their songs if they fit the overall theme).
-- Does the song's Title (and Album Title{', and Description' if has_description_data else ''}, if available) evoke the requested mood, theme, or keywords?
-- Even if an artist is preferred, ensure the specific song fits the overall request.
-
-Select ONLY the songs from the "Available songs" list that genuinely and strongly fit the user's detailed request.
-If a song is a weak match, ambiguous, or you cannot confidently determine its fit from its {available_info_str} against the user's criteria, DO NOT include it.
-It is better to be conservative and select fewer, highly relevant songs.
-Do NOT use any external knowledge about songs beyond what is provided in the "Available songs" list. Your selection must be based on the given data for each song.
-"""
-
-    prompt_critical_instructions = f"""
-CRITICAL INSTRUCTIONS FOR OUTPUT FORMAT:
-1.  Output ONLY the selected songs.
-2.  For EACH selected song, output its "Title by Artist" string on a new line.
-    For example: "Song Title by Artist Name"
-3.  This "Title by Artist" string MUST EXACTLY MATCH the title and artist as they were provided in the input for that specific song (this forms the 'llm_identifier' for matching).
-4.  Do NOT include "Description:", "Album:", "---", any numbering, bullet points, introductory text, concluding text, or ANY other characters or commentary.
-    Your response should be ONLY the list of "Title by Artist" strings, each on its own line.
-
-Available songs:
-{songs_list_for_prompt}
-
-Selected songs for "{new_playlist_title}" based on the detailed criteria:
-"""
-    full_prompt = prompt_intro + prompt_critical_instructions
-
-    try:
-        # print(f"DEBUG: Full prompt to LLM:\n{full_prompt[:2000]}...\n") # For debugging long prompts
-        response = llm_model.generate_content(full_prompt)
-
-        if not response.parts:
-            print("\nAI response was empty or blocked. This might be due to safety filters or an issue with the prompt/model.")
-            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                print(f"Prompt Feedback: {response.prompt_feedback}")
-            # Attempt to print candidate if available and blocked
-            if hasattr(response, 'candidates') and response.candidates:
-                 for candidate_idx, candidate in enumerate(response.candidates):
-                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason != 'STOP':
-                        print(f"  Candidate {candidate_idx+1} Blocked. Reason: {candidate.finish_reason}")
-                        if hasattr(candidate, 'safety_ratings'):
-                             print(f"  Safety Ratings: {candidate.safety_ratings}")
-            return []
-
-        ai_output = response.text.strip()
-        suggested_llm_identifiers = [line.strip() for line in ai_output.split("\n") if line.strip()]
-
-        if not suggested_llm_identifiers:
-            print(f"\nAI did not suggest any songs or the output was empty/malformed.\nLLM Raw Output:\n---\n{ai_output}\n---")
-            return []
-        print(f"\nAI suggested {len(suggested_llm_identifiers)} songs based on detailed criteria:")
-        for item in suggested_llm_identifiers: print(f"  - '{item}'")
-        return suggested_llm_identifiers
-    except Exception as e:
-        print(f"An error during AI song suggestion: {e}")
-        if 'response' in locals() and hasattr(response, 'text'): print(f"LLM Raw Output:\n---\n{response.text}\n---")
-        elif 'response' in locals() and hasattr(response, 'prompt_feedback'): print(f"LLM Prompt Feedback: {response.prompt_feedback}")
-        else: print("LLM Raw Output/Feedback not available.")
-        traceback.print_exc()
+        print("No song data provided to LLM.")
         return []
+
+    # ---------------------------------------------------------
+    # Build the user's criteria
+    # ---------------------------------------------------------
+
+    criteria_prompt_parts = [
+        f'The user wants to create a new playlist titled: "{new_playlist_title}".'
+    ]
+
+    if desc := playlist_criteria.get('description'):
+        criteria_prompt_parts.append(
+            f"Playlist Description: {desc}"
+        )
+
+    if genres := playlist_criteria.get('genres'):
+        criteria_prompt_parts.append(
+            f"Desired Genre(s): {genres}"
+        )
+
+    if artists := playlist_criteria.get('artists'):
+        criteria_prompt_parts.append(
+            f"Preferred Artist(s): {artists}"
+        )
+
+    if moods := playlist_criteria.get('moods'):
+        criteria_prompt_parts.append(
+            f"Desired Mood(s)/Vibe(s): {moods}"
+        )
+
+    if keywords := playlist_criteria.get('keywords'):
+        criteria_prompt_parts.append(
+            f"Other Keywords: {keywords}"
+        )
+
+    criteria_summary = "\n".join(criteria_prompt_parts)
+
+    # ---------------------------------------------------------
+    # Split the playlist into manageable chunks
+    # ---------------------------------------------------------
+
+    song_batches = [
+        song_data_for_llm[i:i + LLM_SONG_BATCH_SIZE]
+        for i in range(0, len(song_data_for_llm), LLM_SONG_BATCH_SIZE)
+    ]
+
+    print(
+        f"Splitting {len(song_data_for_llm)} songs into "
+        f"{len(song_batches)} AI batches "
+        f"({LLM_SONG_BATCH_SIZE} songs maximum each)."
+    )
+
+    all_suggestions = []
+
+    # ---------------------------------------------------------
+    # Process each batch
+    # ---------------------------------------------------------
+
+    for batch_index, song_batch in enumerate(song_batches, start=1):
+
+        print(
+            f"\nProcessing AI batch {batch_index}/{len(song_batches)} "
+            f"({len(song_batch)} songs)..."
+        )
+
+        songs_list = "\n---\n".join(song_batch)
+
+        prompt = f"""
+You are an expert music curator.
+
+{criteria_summary}
+
+You are reviewing a portion of the user's existing music library.
+
+Your task is to select songs that genuinely fit the user's requested
+playlist.
+
+IMPORTANT:
+
+- Use the song title, artist, album, and description when available.
+- You may use your general knowledge of music, artists, genres, and styles
+  to judge whether a song fits.
+- Do NOT invent songs.
+- ONLY select songs that actually appear in the Available Songs list.
+- Be reasonably conservative.
+- A song does not have to literally contain the requested genre in its
+  title. Judge the actual musical identity of the artist/song when possible.
+- If the request is for a genre such as "alternative", include appropriate
+  alternative rock, alternative pop, indie/alternative crossover, etc.,
+  when they genuinely fit.
+- Do not include songs merely because their titles contain a keyword.
+- Preferred artists should receive extra consideration, but only when
+  their specific songs fit the playlist.
+
+OUTPUT FORMAT:
+
+Return ONLY the selected songs.
+
+Each selected song MUST be written exactly like:
+
+Title by Artist
+
+One song per line.
+
+Do NOT include:
+- numbering
+- bullets
+- explanations
+- markdown
+- quotation marks
+- commentary
+- "---"
+
+Available Songs:
+
+{songs_list}
+"""
+
+        try:
+            response = llm_client.models.generate_content(
+                model=LLM_MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=LLM_TEMPERATURE,
+                    max_output_tokens=8000,
+                ),
+            )
+
+            if not response.text:
+                print(
+                    f"  AI returned no usable text for batch "
+                    f"{batch_index}."
+                )
+                continue
+
+            batch_output = response.text.strip()
+
+            batch_suggestions = [
+                line.strip()
+                for line in batch_output.splitlines()
+                if line.strip()
+            ]
+
+            print(
+                f"  AI selected {len(batch_suggestions)} songs "
+                f"from batch {batch_index}."
+            )
+
+            all_suggestions.extend(batch_suggestions)
+
+            # Give the API a little breathing room.
+            if batch_index < len(song_batches):
+                delay = random.uniform(2.0, 4.0)
+                print(
+                    f"  Waiting {delay:.1f}s before next AI batch..."
+                )
+                time.sleep(delay)
+
+        except Exception as e:
+            print(
+                f"\nError processing AI batch "
+                f"{batch_index}/{len(song_batches)}: {e}"
+            )
+            traceback.print_exc()
+
+            # Continue processing the remaining batches rather than
+            # destroying the entire playlist operation.
+            continue
+
+    # ---------------------------------------------------------
+    # Remove duplicate suggestions
+    # ---------------------------------------------------------
+
+    unique_suggestions = []
+    seen = set()
+
+    for suggestion in all_suggestions:
+        normalized = normalize_text(suggestion)
+
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique_suggestions.append(suggestion)
+
+    print(
+        f"\nAI selected {len(unique_suggestions)} unique songs "
+        f"across all batches."
+    )
+
+    for item in unique_suggestions:
+        print(f"  - '{item}'")
+
+    return unique_suggestions
 
 def match_songs_to_video_ids(
     suggested_llm_identifiers: list[str], source_song_data_map: dict
